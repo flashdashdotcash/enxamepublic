@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from aiohttp import web
 
 from core.exp.security import EXPSecurity
 
@@ -428,6 +429,33 @@ class BeeService:
             # Identidade já foi gerada no config
             logger.info(f"Nova identidade: {self.node_id}")
 
+    async def _handle_peer_message(self, request: web.Request) -> web.Response:
+        """Validate and dispatch a BEE protocol message received over HTTP."""
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Expected JSON object")
+            envelope = BeeEnvelope.from_dict(payload)
+            if envelope.timestamp.utcoffset() is None:
+                raise ValueError("Timezone required")
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return web.json_response({"error": "Invalid BEE envelope"}, status=400)
+
+        if envelope.target_node_id not in (None, self.node_id):
+            return web.json_response({"error": "Wrong target node"}, status=400)
+
+        if self.config.shared_secret and (
+            not envelope.signature or not self._handler.verify_envelope(envelope)
+        ):
+            return web.json_response({"error": "Invalid peer signature"}, status=401)
+
+        response = await self._handler.handle_message(envelope)
+        if response is None:
+            return web.Response(status=204)
+
+        self._handler.sign_envelope(response)
+        return web.json_response(response.to_dict())
+
     async def _start_http_server(self) -> None:
         """Inicia servidor HTTP para API, WebSocket e UI estática."""
         from aiohttp import web
@@ -577,6 +605,7 @@ class BeeService:
         app.router.add_get("/health", health)
         app.router.add_get("/api/v1/status", status)
         app.router.add_post("/api/v1/query", query)
+        app.router.add_post("/api/v1/bee/message", self._handle_peer_message)
         app.router.add_get("/api/v1/capabilities", capabilities)
         app.router.add_get("/api/v1/peers", peers)
         app.router.add_get("/api/cluster/discover", discover)
@@ -856,10 +885,11 @@ class BeeService:
 
         app.router.add_get("/health", health)
         app.router.add_post("/api/v1/query", query)
+        app.router.add_post("/api/v1/bee/message", self._handle_peer_message)
         app.router.add_get("/api/v1/capabilities", capabilities)
         app.router.add_get("/api/v1/cluster", cluster_status)
         app.router.add_get("/api/v1/peers", peers)
-        app.router.add_get("/api/cluster/discover", discover)
+        app.router.add_get("/api/cluster/discover", peers)
 
         # Compatibilidade com Web UI
         # /api/status - formato esperado pela sidebar
@@ -1273,11 +1303,20 @@ class BeeService:
             return
         try:
             url = f"http://{peer.host}:{peer.port}/api/v1/bee/message"
+            self._handler.sign_envelope(envelope)
             async with self._http_session.post(url, json=envelope.to_dict(), timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     response_envelope = BeeEnvelope.from_dict(data)
-                    self._handler.complete_pending_request(envelope.correlation_id or envelope.msg_id, response_envelope)
+                    if self.config.shared_secret and (
+                        not response_envelope.signature
+                        or not self._handler.verify_envelope(response_envelope)
+                    ):
+                        logger.warning("Rejected invalid peer response from %s", peer.node_id)
+                        return
+                    self._handler.complete_pending_request(
+                        envelope.correlation_id or envelope.msg_id, response_envelope
+                    )
         except Exception as e:
             logger.debug(f"Falha ao enviar para {peer.node_id}: {e}")
 
@@ -1451,6 +1490,7 @@ class BeeService:
             return None
         try:
             url = f"http://{peer.host}:{peer.port}/api/v1/bee/message"
+            self._handler.sign_envelope(envelope)
             async with self._http_session.post(
                 url, 
                 json=envelope.to_dict(), 
@@ -1458,7 +1498,17 @@ class BeeService:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return BeeEnvelope.from_dict(data)
+                    response = BeeEnvelope.from_dict(data)
+                    if response.source_node_id != peer.node_id:
+                        return None
+                    if response.correlation_id != envelope.correlation_id:
+                        return None
+                    if self.config.shared_secret and (
+                        not response.signature or not self._handler.verify_envelope(response)
+                    ):
+                        logger.warning("Rejected invalid peer response from %s", peer.node_id)
+                        return None
+                    return response
         except Exception as e:
             logger.debug(f"Falha ao enviar para {peer.node_id}: {e}")
         return None
