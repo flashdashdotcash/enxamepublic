@@ -137,8 +137,12 @@ class BeeProtocolHandler:
                 envelope, BeeErrorCode.TIMEOUT, "Mensagem expirada"
             )
 
-        # Verifica assinatura se security habilitado
-        if self._security and envelope.signature:
+        # If a shared secret is configured, unsigned messages must never reach handlers.
+        if self._security:
+            if not envelope.signature:
+                return self._create_error_response(
+                    envelope, BeeErrorCode.AUTH_FAILED, "Assinatura obrigatória"
+                )
             try:
                 signable = envelope.as_signable_dict()
                 if not self._security.verify_payload(signable, envelope.signature):
@@ -721,10 +725,13 @@ class BeeProtocolHandler:
         """Verifica assinatura de envelope.
 
         Returns:
-            True se válida ou se security não habilitado, False se inválida
+            True only for a valid signature when security is configured.
+            Unauthenticated mode is preserved when no shared secret is set.
         """
-        if not self._security or not envelope.signature:
-            return True  # Sem security ou sem signature = aceita
+        if not self._security:
+            return True
+        if not envelope.signature:
+            return False
 
         try:
             signable = envelope.as_signable_dict()
