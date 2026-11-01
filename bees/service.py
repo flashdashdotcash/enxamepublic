@@ -1097,6 +1097,19 @@ class BeeService:
                     metadata=item.get("metadata", {}),
                 ))
 
+            # The librarian's search() normally returns a synthesized answer,
+            # not a "results" list. Preserve that answer in the BEE response
+            # so the requester can use knowledge found by this peer.
+            answer = search_result.get("answer", "")
+            confidence = search_result.get("confidence", 0.0)
+            if not results and answer and confidence > 0:
+                results.append(ResearchResultItem(
+                    content=answer,
+                    source=search_result.get("source"),
+                    confidence=confidence,
+                    metadata=search_result.get("metadata") or {},
+                ))
+
         return self._handler.create_research_result(
             target_node_id=envelope.source_node_id,
             request_id=request.request_id,
